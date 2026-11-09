@@ -15,9 +15,7 @@ pipeline {
 
     stages {
         stage('Checkout') {
-            steps {
-                checkout scm
-            }
+            steps { checkout scm }
         }
 
         stage('Terraform Tooling') {
@@ -45,11 +43,9 @@ pipeline {
         stage('Terraform Plan') {
             steps {
                 withCredentials([
-                    usernamePassword(
-                        credentialsId: 'azure-sp',
+                    usernamePassword(credentialsId: 'azure-sp',
                         usernameVariable: 'ARM_CLIENT_ID',
-                        passwordVariable: 'ARM_CLIENT_SECRET'
-                    ),
+                        passwordVariable: 'ARM_CLIENT_SECRET'),
                     string(credentialsId: 'azure-tenant-id', variable: 'ARM_TENANT_ID'),
                     string(credentialsId: 'azure-subscription-id', variable: 'ARM_SUBSCRIPTION_ID')
                 ]) {
@@ -68,7 +64,7 @@ pipeline {
         stage('Approval') {
             steps {
                 input(
-                    message: 'Review the archived Terraform plan. Approve creation/update of the Azure Resource Group?',
+                    message: 'Review the archived Terraform plan. Approve Azure Resource Group deployment?',
                     ok: 'Approve Terraform Apply',
                     submitterParameter: 'APPROVED_BY'
                 )
@@ -78,11 +74,9 @@ pipeline {
         stage('Terraform Apply') {
             steps {
                 withCredentials([
-                    usernamePassword(
-                        credentialsId: 'azure-sp',
+                    usernamePassword(credentialsId: 'azure-sp',
                         usernameVariable: 'ARM_CLIENT_ID',
-                        passwordVariable: 'ARM_CLIENT_SECRET'
-                    ),
+                        passwordVariable: 'ARM_CLIENT_SECRET'),
                     string(credentialsId: 'azure-tenant-id', variable: 'ARM_TENANT_ID'),
                     string(credentialsId: 'azure-subscription-id', variable: 'ARM_SUBSCRIPTION_ID')
                 ]) {
@@ -99,14 +93,8 @@ pipeline {
     }
 
     post {
-        success {
-            echo 'Azure Resource Group Terraform deployment completed successfully.'
-        }
-        failure {
-            echo 'Terraform pipeline failed. Review the Jenkins console output.'
-        }
-        always {
-            echo 'Terraform pipeline execution finished.'
-        }
+        success { echo 'Azure Resource Group deployment completed successfully.' }
+        failure { echo 'Terraform pipeline failed. Review Jenkins console output.' }
+        always { echo 'Terraform pipeline execution finished.' }
     }
 }
