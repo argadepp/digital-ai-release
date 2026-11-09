@@ -1,0 +1,3 @@
+resource_group_name = "rg-dai-demo-dev"
+location            = "Central India"
+environment         = "DEV"
