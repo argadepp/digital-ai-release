@@ -1,0 +1,52 @@
+
+services:
+
+  digital-ai-release:
+    image: xebialabs/xl-release:26.3.0
+    container_name: digital-ai-release
+    restart: unless-stopped
+
+    ports:
+      - "5516:5516"
+
+    environment:
+      ADMIN_PASSWORD: ${RELEASE_ADMIN_PASSWORD}
+      ACCEPT_EULA: "Y"
+
+    volumes:
+      - release-conf:/opt/xebialabs/xl-release-server/conf
+      - release-repository:/opt/xebialabs/xl-release-server/repository
+      - release-archive:/opt/xebialabs/xl-release-server/archive
+      - release-reports:/opt/xebialabs/xl-release-server/reports
+
+    networks:
+      - devops-lab
+
+  jenkins:
+    image: jenkins/jenkins:lts-jdk21
+    container_name: jenkins
+    restart: unless-stopped
+
+    ports:
+      - "8081:8080"
+      - "50000:50000"
+
+    environment:
+      JENKINS_OPTS: "--httpPort=8080"
+
+    volumes:
+      - jenkins-home:/var/jenkins_home
+
+    networks:
+      - devops-lab
+
+volumes:
+  release-conf:
+  release-repository:
+  release-archive:
+  release-reports:
+  jenkins-home:
+
+networks:
+  devops-lab:
+    name: devops-lab

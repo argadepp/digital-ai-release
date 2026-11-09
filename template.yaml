@@ -1,0 +1,91 @@
+
+apiVersion: xl-release/v1
+kind: Templates
+
+spec:
+  - name: SpringBoot-3-Environment-Release
+    type: xlrelease.Release
+
+    description: |
+      Three environment release orchestration.
+      DEV -> QA -> PROD using Jenkins.
+
+    variables:
+      - key: appName
+        label: Application Name
+        type: xlrelease.StringVariable
+        value: springboot-demo
+
+      - key: appVersion
+        label: Application Version
+        type: xlrelease.StringVariable
+        requiresValue: true
+        showOnReleaseStart: true
+
+      - key: imageTag
+        label: Docker Image Tag
+        type: xlrelease.StringVariable
+        requiresValue: true
+        showOnReleaseStart: true
+
+    phases:
+      - name: 01 - DEV
+        type: xlrelease.Phase
+
+        tasks:
+          - name: DEV Build
+            type: jenkins.Build
+            jenkinsServer: Jenkins
+            jobName: demo-build
+
+          - name: DEV Deployment
+            type: jenkins.Build
+            jenkinsServer: Jenkins
+            jobName: demo-deploy
+            jobParameters: |
+              TARGET_ENV=DEV
+              IMAGE_TAG=${imageTag}
+
+          - name: DEV Smoke Test
+            type: xlrelease.Task
+            description: Verify the DEV deployment.
+
+      - name: 02 - QA
+        type: xlrelease.Phase
+
+        tasks:
+          - name: QA Deployment
+            type: jenkins.Build
+            jenkinsServer: Jenkins
+            jobName: demo-deploy
+            jobParameters: |
+              TARGET_ENV=QA
+              IMAGE_TAG=${imageTag}
+
+          - name: QA Validation
+            type: xlrelease.Task
+            description: Execute QA validation.
+
+          - name: QA Approval
+            type: xlrelease.Task
+            description: QA team must approve this release.
+
+      - name: 03 - PROD
+        type: xlrelease.Phase
+
+        tasks:
+          - name: Production Approval
+            type: xlrelease.Task
+            description: Release manager approval required.
+
+          - name: PROD Deployment
+            type: jenkins.Build
+            jenkinsServer: Jenkins
+            jobName: demo-deploy
+            jobParameters: |
+              TARGET_ENV=PROD
+              IMAGE_TAG=${imageTag}
+
+          - name: Production Verification
+            type: xlrelease.Task
+            description: Verify production application health.
