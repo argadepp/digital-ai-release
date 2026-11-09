@@ -1,0 +1,157 @@
+name: Azure Resource Group - Terraform
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-azure.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: azure-resource-group-terraform
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.11.4"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  ARM_USE_OIDC: "true"
+  ARM_USE_AZUREAD: "true"
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  plan:
+    name: Terraform Plan
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform format check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        env:
+          TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+          TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TFSTATE_CONTAINER}" \
+            -backend-config="key=digital-ai-release/dev.tfstate"
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: |
+          terraform plan -input=false -no-color -out=tfplan > "$RUNNER_TEMP/terraform-plan.log"
+          terraform show -json tfplan > "$RUNNER_TEMP/tfplan.json"
+
+      - name: Write plan summary
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "tfplan.json"), encoding="utf-8") as f:
+              plan = json.load(f)
+
+          counts = {"create": 0, "update": 0, "delete": 0, "replace": 0, "no-op": 0}
+          for item in plan.get("resource_changes", []):
+              actions = item.get("change", {}).get("actions", [])
+              if actions == ["create"]:
+                  counts["create"] += 1
+              elif actions == ["update"]:
+                  counts["update"] += 1
+              elif actions == ["delete"]:
+                  counts["delete"] += 1
+              elif actions == ["delete", "create"] or actions == ["create", "delete"]:
+                  counts["replace"] += 1
+              elif actions == ["no-op"]:
+                  counts["no-op"] += 1
+
+          summary = (
+              "## Terraform plan summary\n\n"
+              f"- Resources to create: **{counts['create']}**\n"
+              f"- Resources to update: **{counts['update']}**\n"
+              f"- Resources to delete: **{counts['delete']}**\n"
+              f"- Resources to replace: **{counts['replace']}**\n"
+              f"- No-op resources: **{counts['no-op']}**\n\n"
+              "The full plan file is retained as a short-lived workflow artifact. "
+              "Review it before approving the apply job.\n"
+          )
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(summary)
+          PY
+
+      - name: Upload Terraform plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: terraform/tfplan
+          if-no-files-found: error
+          retention-days: 1
+
+  apply:
+    name: Terraform Apply
+    if: github.ref == 'refs/heads/master'
+    needs: plan
+    runs-on: ubuntu-latest
+    environment:
+      name: azure-apply
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        env:
+          TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+          TFSTATE_CONTAINER: ${{ vars.TFSTATE_CONTAINER }}
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="storage_account_name=${TFSTATE_STORAGE_ACCOUNT}" \
+            -backend-config="container_name=${TFSTATE_CONTAINER}" \
+            -backend-config="key=digital-ai-release/dev.tfstate"
+
+      - name: Download reviewed Terraform plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: terraform
+
+      - name: Terraform apply
+        run: |
+          terraform apply -input=false -no-color -auto-approve tfplan
+
+      - name: Show Terraform outputs
+        run: terraform output
