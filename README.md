@@ -1,149 +1,171 @@
-# Digital.ai Release + Jenkins + Terraform + Azure POC
+# Digital.ai Release + GitHub Actions + Terraform + Azure POC
 
-This repository demonstrates an initial Infrastructure as Code workflow that creates an Azure Resource Group with Terraform. Jenkins checks out the repository, validates Terraform, creates a plan, waits for manual approval, then applies the saved plan.
+This repository provisions an Azure Resource Group using Terraform and GitHub Actions. GitHub Actions authenticates to Azure with OpenID Connect (OIDC), stores Terraform state in Azure Blob Storage, generates a plan, waits for a protected-environment approval, and applies the reviewed plan.
 
 ## Architecture
 
 ```text
-GitHub push -> GitHub webhook (HTTPS tunnel) -> Jenkins Pipeline
-             -> Terraform fmt/init/validate -> plan -> approval -> apply
-             -> Azure Resource Group
+Push to master
+    |
+    v
+GitHub Actions - Terraform Plan
+    |  OIDC authentication
+    |  terraform fmt / init / validate / plan
+    |  Azure Blob remote state
+    v
+Short-lived Terraform plan artifact
+    |
+    v
+GitHub Environment approval: azure-apply
+    |
+    v
+GitHub Actions - Terraform Apply
+    |
+    v
+Azure Resource Group
 ```
 
-For this first iteration, approval is a Jenkins input gate. Digital.ai Release can become the governed release orchestrator in the next phase.
+Jenkins remains optional for a later Digital.ai Release integration. It is not used by this Terraform deployment workflow.
 
 ## Repository layout
 
 ```text
 .
+├── .github/workflows/terraform-azure.yml
+├── terraform/
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── outputs.tf
+│   └── terraform.tfvars.example
 ├── Jenkinsfile
-├── jenkins/Dockerfile
-└── terraform/
-    ├── main.tf
-    ├── variables.tf
-    ├── outputs.tf
-    └── terraform.tfvars.example
+└── jenkins/Dockerfile
 ```
 
-## 1. Azure service principal
+## 1. Configure GitHub Actions variables
 
-Sign in and select your intended subscription:
+In **GitHub repository → Settings → Secrets and variables → Actions → Variables**, add these repository variables:
+
+| Variable | Value |
+|---|---|
+| `AZURE_CLIENT_ID` | Microsoft Entra application / service principal client ID |
+| `AZURE_TENANT_ID` | Microsoft Entra tenant ID |
+| `AZURE_SUBSCRIPTION_ID` | Azure subscription ID |
+| `TFSTATE_STORAGE_ACCOUNT` | Existing Azure Storage Account name |
+| `TFSTATE_CONTAINER` | Existing Blob container name |
+
+These are identifiers, not passwords. Do not add a client secret; this workflow uses OIDC.
+
+The backend state key is set in the workflow to `digital-ai-release/dev.tfstate`.
+
+## 2. Configure Azure identity and role assignments
+
+Create or reuse a Microsoft Entra application and its service principal. The application must have a federated identity credential for the GitHub Actions workflow.
+
+This repository uses GitHub's immutable OIDC subject format. Its repository owner ID is `90461882` and repository ID is `1451077215`. Add **two** federated credentials to the same Entra application:
+
+### Plan job — master branch
+
+Create a federated credential with:
+
+- Issuer: `https://token.actions.githubusercontent.com`
+- Audience: `api://AzureADTokenExchange`
+- Subject: `repo:argadepp@90461882/digital-ai-release@1451077215:ref:refs/heads/master`
+
+### Apply job — protected GitHub Environment
+
+Create a second federated credential with:
+
+- Issuer: `https://token.actions.githubusercontent.com`
+- Audience: `api://AzureADTokenExchange`
+- Subject: `repo:argadepp@90461882/digital-ai-release@1451077215:environment:azure-apply`
+
+The apply job uses the `azure-apply` GitHub Environment, so its OIDC subject is different from the plan job's branch subject. The two credentials are both required.
+
+You can create federated credentials in **Azure Portal → Microsoft Entra ID → App registrations → your application → Certificates & secrets → Federated credentials → Add credential → GitHub Actions deploying Azure resources**. If the portal's preset does not show the immutable subject format, enter the exact subject above using the custom issuer/audience/subject option or Azure CLI.
+
+### Azure RBAC permissions
+
+Assign the service principal:
+
+1. **Contributor** at the subscription scope (needed for this initial Terraform configuration to create a Resource Group). This is broad; use a dedicated lab subscription. For production, define a least-privilege custom role.
+2. **Storage Blob Data Contributor** scoped to the state container (or, if necessary, the storage account) so Terraform can read/write the state blob and use blob leases for state locking.
+
+Example commands (run as an administrator with permission to assign roles; replace placeholders):
 
 ```bash
-az login
-az account show --query "{name:name,id:id,tenant:tenantId}" -o table
-az account set --subscription "<YOUR_SUBSCRIPTION_ID>"
+SUBSCRIPTION_ID="<subscription-id>"
+SP_OBJECT_ID="<service-principal-object-id>"
+STATE_RESOURCE_GROUP="<storage-account-resource-group>"
+STATE_STORAGE_ACCOUNT="<storage-account-name>"
+STATE_CONTAINER="<container-name>"
+
+az role assignment create \
+  --assignee-object-id "$SP_OBJECT_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Contributor" \
+  --scope "/subscriptions/$SUBSCRIPTION_ID"
+
+az role assignment create \
+  --assignee-object-id "$SP_OBJECT_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Storage Blob Data Contributor" \
+  --scope "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$STATE_RESOURCE_GROUP/providers/Microsoft.Storage/storageAccounts/$STATE_STORAGE_ACCOUNT/blobServices/default/containers/$STATE_CONTAINER"
 ```
 
-For a disposable lab only, create a service principal with Contributor at subscription scope:
+Allow a few minutes for role assignments to propagate.
 
-```bash
-az ad sp create-for-rbac \
-  --name "sp-jenkins-terraform-demo" \
-  --role Contributor \
-  --scopes "/subscriptions/<YOUR_SUBSCRIPTION_ID>"
-```
+## 3. Protect the apply job with GitHub Environment approval
 
-Securely save the returned `appId`, `password`, and `tenant`. Identity creation and role assignment require appropriate Entra ID/Azure permissions. Subscription-scope Contributor is broad; use a dedicated lab subscription or a least-privilege custom role for longer-lived use.
+1. Open **Settings → Environments** in this repository.
+2. Create an environment named exactly `azure-apply`.
+3. Add yourself (or another trusted maintainer) as a required reviewer.
+4. Enable **Prevent self-review** if you want a different person to approve the deployment.
+5. Restrict deployment branches to `master`.
 
-## 2. Jenkins credentials
+The plan job runs first. The apply job waits for approval before it can access the protected environment and its OIDC trust.
 
-Create these in **Manage Jenkins → Credentials → (global) → Add Credentials**:
+## 4. Terraform remote backend
 
-| ID | Kind | Value |
-|---|---|---|
-| `azure-sp` | Username with password | Username = appId; Password = service principal password |
-| `azure-tenant-id` | Secret text | Tenant ID |
-| `azure-subscription-id` | Secret text | Subscription ID |
+The Terraform configuration contains an `azurerm` backend configured for OIDC and Microsoft Entra authentication:
 
-AzureRM reads `ARM_CLIENT_ID`, `ARM_CLIENT_SECRET`, `ARM_TENANT_ID`, and `ARM_SUBSCRIPTION_ID` from the environment. Never put these values in Git.
+- Storage account and container names are supplied to `terraform init` from GitHub repository variables.
+- State key: `digital-ai-release/dev.tfstate`.
+- Blob leases provide state locking.
+- The backend uses Microsoft Entra data-plane authentication; no storage account access key is stored in GitHub.
 
-## 3. Jenkins image with Terraform
+The storage account and container must already exist before the workflow runs. Keep public blob access disabled and enable appropriate storage network restrictions.
 
-The `jenkins/Dockerfile` installs Terraform in a Jenkins LTS image. Merge this service configuration into your existing Compose file. Keep the Digital.ai Release service, existing volumes, and shared network unchanged:
+## 5. Run the workflow
 
-```yaml
-jenkins:
-  build:
-    context: ./jenkins
-  image: local/jenkins-terraform:1.0
-  container_name: jenkins
-  restart: unless-stopped
-  ports:
-    - "8081:8080"
-    - "50000:50000"
-  volumes:
-    - jenkins-home:/var/jenkins_home
-  networks:
-    - devops-lab
-```
+The workflow runs automatically when changes are pushed to `master` under `terraform/**` or the workflow file. You can also start it from **Actions → Azure Resource Group - Terraform → Run workflow** on `master`.
 
-This assumes your Compose file already defines `jenkins-home` and `devops-lab`. Do not replace your entire Compose file with this fragment.
+Expected stages:
 
-```bash
-docker compose build jenkins
-docker compose up -d jenkins
-docker exec jenkins terraform version
-```
+1. Terraform format check.
+2. Terraform init against the Azure Blob backend.
+3. Terraform validate.
+4. Terraform plan and a resource-count summary.
+5. Short-lived plan artifact upload.
+6. Manual approval in the `azure-apply` environment.
+7. Apply the reviewed plan and display outputs.
 
-## 4. Jenkins pipeline job
+The current Terraform configuration creates Resource Group `rg-dai-demo-dev` in `Central India`, tagged as `DEV`.
 
-1. Install/enable the Jenkins GitHub plugin.
-2. Create **New Item → Pipeline**, e.g. `azure-rg-terraform`.
-3. Under **Build Triggers**, enable **GitHub hook trigger for GITScm polling**.
-4. Under **Pipeline**, select **Pipeline script from SCM**.
-5. Select Git; repository URL: `https://github.com/argadepp/digital-ai-release.git`; branch: `*/master`; script path: `Jenkinsfile`.
-6. Configure Git credentials if required.
-7. Save and run once manually before testing the webhook.
+## 6. Important security notes
 
-## 5. GitHub webhook for local Jenkins
+- This repository is currently public. Terraform plan artifacts can contain sensitive values. The current Resource Group-only plan has no configured secrets, but **make the repository private before adding infrastructure that handles credentials, connection strings, private values, or other sensitive data**.
+- The plan artifact is retained for one day only.
+- Never commit Terraform state, plan files, client secrets, access keys, or secret tfvars.
+- Commit `.terraform.lock.hcl` after the first successful local or workflow initialization to pin provider selections.
+- Keep the state storage account private and grant the workflow identity only the required data-plane role on the state container.
+- Do not configure a second pipeline to apply the same Terraform state concurrently. The workflow concurrency group and Azure Blob state lock help prevent overlapping operations.
 
-GitHub cannot reach localhost directly. Expose Jenkins host port 8081 through a temporary HTTPS tunnel, for example:
+## 7. Next phase: Digital.ai Release
 
-```bash
-ngrok http 8081
-```
+Later, Digital.ai Release can initiate this GitHub Actions workflow, provide a governed approval process, and capture the deployment result. Avoid running both a direct push-triggered apply and a Release-triggered apply for the same change.
 
-In GitHub **Settings → Webhooks → Add webhook**:
+## References
 
-- Payload URL: `https://<your-ngrok-host>/github-webhook/`
-- Content type: `application/json`
-- Events: **Just the push event**
-- Active: enabled
-
-The tunnel hostname can change after restart; update the webhook when it does.
-
-**Security:** This tunnel exposes the Jenkins web interface as well as the webhook endpoint. Keep Jenkins authentication enabled, use strong credentials, and stop the tunnel when not in use. Configure and verify webhook secret validation where supported by your Jenkins GitHub plugin configuration. This is temporary lab ingress, not a production pattern.
-
-## 6. Terraform defaults
-
-The default configuration creates Resource Group `rg-dai-demo-dev` in `Central India`, tagged with environment `DEV`. Copy `terraform/terraform.tfvars.example` to `terraform/terraform.tfvars` to override values. The real tfvars file is ignored by Git.
-
-## 7. Test
-
-1. Push a change to `master`.
-2. Check GitHub **Settings → Webhooks → Recent Deliveries**.
-3. Confirm the Jenkins job starts.
-4. Review the archived Terraform plan in Jenkins.
-5. Approve only after checking the plan.
-6. Verify the Resource Group in the intended Azure subscription.
-
-For this initial lab, state is stored in the Jenkins workspace. This is not a durable or team-safe backend. Before expanding the POC, configure an Azure Storage remote backend, state locking, access controls, and a recovery plan.
-
-## 8. Next phase: Digital.ai Release
-
-A future flow can be:
-
-1. GitHub push triggers validation and Terraform plan.
-2. Digital.ai Release starts/receives the release event.
-3. Release approval gates the apply step.
-4. Release invokes Jenkins apply and records the result.
-5. A post-deployment task verifies the Resource Group.
-
-Avoid leaving both direct GitHub-triggered apply and Release-controlled apply enabled, to prevent duplicate applies.
-
-## Notes
-
-- Never commit Terraform state, plan files, client secrets, or secret tfvars.
-- Commit `.terraform.lock.hcl` after the first successful `terraform init` for reproducible provider selection.
-- The Jenkins image uses Terraform 1.11.4; the Terraform configuration requires 1.6+ and AzureRM provider 4.x.
+- [GitHub: Configure OpenID Connect in Azure](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-azure)
+- [HashiCorp: AzureRM backend](https://developer.hashicorp.com/terraform/language/backend/azurerm)
+- [Microsoft: Store Terraform state in Azure Storage](https://learn.microsoft.com/en-us/azure/terraform/terraform-backend)
